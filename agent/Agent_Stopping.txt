@@ -1,0 +1,18 @@
+-- Process Find
+Get-WmiObject Win32_Process -Filter "Name='powershell.exe'" | Select-Object ProcessId, CommandLine
+
+
+-- Process Kill
+Stop-Process -Id 1456 -Force
+
+
+-- Task Disable
+Get-ScheduledTask | ForEach-Object {
+    $task = $_
+    $task.Actions | ForEach-Object {
+        if ($_.Arguments -like "*NetAgent*") {
+            Disable-ScheduledTask -TaskName $task.TaskName
+            Write-Host "Disabled: $($task.TaskName)"
+        }
+    }
+}
