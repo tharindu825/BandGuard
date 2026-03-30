@@ -195,6 +195,16 @@ app.get('/api/devices', (req, res) => {
   res.json(devices.map(d => ({ ...d, is_online: isOnline(d.last_seen) })));
 });
 
+// ── GET /api/devices/status/:name — polled by agent for self-enforcement ─
+app.get('/api/devices/status/:name', (req, res) => {
+  const device = db.prepare(
+      `SELECT is_blocked FROM devices WHERE device_name = ?`
+  ).get(req.params.name);
+
+  if (!device) return res.json({ is_blocked: 0 });
+  res.json({ is_blocked: device.is_blocked });
+});
+
 // ── GET /api/history/:name — per-device 30-day history ───
 app.get('/api/history/:name', (req, res) => {
   const rows = db.prepare(`

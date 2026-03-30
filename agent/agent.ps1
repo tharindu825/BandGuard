@@ -10,9 +10,12 @@
 #   - Early exit for pure LAN-only activity
 # ============================================================
 
-$SERVER_URL  = "http://SERVER_IP:3000/api/usage"   # <-- SET THIS during install
+$SERVER_URL      = "http://SERVER_IP:3000/api/usage"   # <-- SET THIS during install
+$SERVER_URL_BASE = "http://SERVER_IP:3000"          # <-- ADD THIS during install
 $DEVICE_NAME = $env:COMPUTERNAME
 $INTERVAL    = 15   # seconds between snapshots
+$STATUS_CHECK_EVERY = 4   # Check block status every N intervals (every 60s = 4 x 15s)
+$statusCheckCounter = 0   # Internal counter — no need to change this
 
 # ── Resolve local IPv4 address ─────────────────────────────
 $DEVICE_IP = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
@@ -108,6 +111,41 @@ function Write-ErrorLog([string]$msg) {
     } catch {}
 }
 
+# ── Apply internet block via Windows Firewall ──────────────
+function Set-InternetBlock {
+    $outExists = Get-NetFirewallRule -DisplayName "BandGuard-BlockInternet-OUT" `
+                 -ErrorAction SilentlyContinue
+    $inExists  = Get-NetFirewallRule -DisplayName "BandGuard-BlockInternet-IN"  `
+                 -ErrorAction SilentlyContinue
+
+    if (-not $outExists) {
+        New-NetFirewallRule `
+            -DisplayName "BandGuard-BlockInternet-OUT" `
+            -Direction Outbound `
+            -Action Block `
+            -RemoteAddress Internet `
+            -Profile Any `
+            -Enabled True | Out-Null
+    }
+    if (-not $inExists) {
+        New-NetFirewallRule `
+            -DisplayName "BandGuard-BlockInternet-IN" `
+            -Direction Inbound `
+            -Action Block `
+            -RemoteAddress Internet `
+            -Profile Any `
+            -Enabled True | Out-Null
+    }
+}
+
+# ── Remove internet block from Windows Firewall ────────────
+function Remove-InternetBlock {
+    Remove-NetFirewallRule -DisplayName "BandGuard-BlockInternet-OUT" `
+        -ErrorAction SilentlyContinue
+    Remove-NetFirewallRule -DisplayName "BandGuard-BlockInternet-IN"  `
+        -ErrorAction SilentlyContinue
+}
+
 # ── Single Instance Mutex ──────────────────────────────────
 $mutex = New-Object System.Threading.Mutex($false, "Global\InternetUsageTrackerAgent")
 if (-not $mutex.WaitOne(0, $false)) {
@@ -177,6 +215,36 @@ try {
                     -TimeoutSec 10 -ErrorAction Stop | Out-Null
             } catch {
                 Write-ErrorLog "POST failed: $_"
+            }
+        }
+
+        # ── SELF-ENFORCEMENT: Poll server for block status ─────
+        $statusCheckCounter++
+        if ($statusCheckCounter -ge $STATUS_CHECK_EVERY) {
+            $statusCheckCounter = 0
+
+            try {
+                $statusUrl    = "$SERVER_URL_BASE/api/devices/status/$DEVICE_NAME"
+                $deviceStatus = Invoke-RestMethod -Uri $statusUrl -Method GET `
+                                    -TimeoutSec 5 -ErrorAction Stop
+
+                $blockRuleExists = Get-NetFirewallRule `
+                                    -DisplayName "BandGuard-BlockInternet-OUT" `
+                                    -ErrorAction SilentlyContinue
+
+                if ($deviceStatus.is_blocked -eq 1 -and -not $blockRuleExists) {
+                    # Server says blocked → apply firewall rules
+                    Set-InternetBlock
+                    Write-ErrorLog "INFO: Internet blocked by quota enforcement"
+
+                } elseif ($deviceStatus.is_blocked -eq 0 -and $blockRuleExists) {
+                    # Server says unblocked (reset/manual) → remove firewall rules
+                    Remove-InternetBlock
+                    Write-ErrorLog "INFO: Internet unblocked - quota reset"
+                }
+
+            } catch {
+                Write-ErrorLog "Status check failed: $_"
             }
         }
     }
