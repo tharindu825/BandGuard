@@ -82,7 +82,7 @@ export default function Dashboard() {
         <div className="header-left">
           <div className="header-logo">📡</div>
           <div>
-            <h1>Usage Tracker</h1>
+            <h1>BandGuard</h1>
             <div className="header-subtitle">Internet-only bandwidth monitoring · Auto-refreshes every 30s</div>
           </div>
         </div>
