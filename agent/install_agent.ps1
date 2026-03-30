@@ -31,7 +31,9 @@ if (-not (Test-Path $agentSource)) {
     exit 1
 }
 $content = Get-Content $agentSource -Raw -Encoding UTF8
+$baseUrl = $ServerURL -replace '/api/usage.*', ''
 $content  = $content -replace 'http://SERVER_IP:3000/api/usage', $ServerURL
+$content  = $content -replace 'http://SERVER_IP:3000', $baseUrl
 Set-Content -Path $SCRIPT_DEST -Value $content -Encoding UTF8
 Write-Host "[2/4] Agent copied to $SCRIPT_DEST" -ForegroundColor Green
 

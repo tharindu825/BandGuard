@@ -1,0 +1,14 @@
+[NetAgent] Installing BandGuard Agent...
+At line:1 char:39
++ (Get-Content 'C:\NetAgent\agent.ps1') ^
++                                       ~
+Unexpected token '^' in expression or 
+statement.
+    + CategoryInfo          : ParserError: ( 
+   :) [], ParentContainsErrorRecordExceptio  
+  n
+    + FullyQualifiedErrorId : UnexpectedToke 
+   n
+ 
+'-replace' is not recognized as an internal or external command,
+operable program or batch file.
