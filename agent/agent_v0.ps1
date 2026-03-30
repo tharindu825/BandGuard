@@ -1,37 +1,21 @@
 # ============================================================
-# Internet Usage Agent v8.1
+# Internet Usage Agent v7.0
 # Deploy to each PC at: C:\NetAgent\agent.ps1
 # Runs every 60 seconds via Task Scheduler as SYSTEM
-#
-# v8.1 Changes:
-#   - Auto-detects real gateway at startup (no hardcoding)
-#   - Works on any PC regardless of gateway IP
-#   - Block = change default gateway to 192.168.1.11
-#   - Unblock = restore auto-detected real gateway
+# 
+# Fixes in v7.0:
+#   - True internet-only tracking (excludes SMB/LAN traffic)
+#   - UDP/QUIC detection (YouTube, Netflix, HTTP/3)
+#   - Pro-rating when LAN + Internet active simultaneously
+#   - Early exit for pure LAN-only activity
 # ============================================================
 
-$SERVER_URL         = "http://192.168.1.32:3000/api/usage"
-$SERVER_URL_BASE    = "http://192.168.1.32:3000"
-$DEVICE_NAME        = $env:COMPUTERNAME
-$INTERVAL           = 15   # seconds between snapshots
-$STATUS_CHECK_EVERY = 4    # check block status every 4 x 15s = 60s
-$statusCheckCounter = 0
-
-$BLOCKED_GATEWAY    = "192.168.1.11"   # dead-end gateway — never changes
-
-# ── Auto-detect real gateway at startup ───────────────────
-# Reads whatever gateway is currently set (works on any PC)
-# Excludes the blocked gateway in case PC rebooted while blocked
-$REAL_GATEWAY = (Get-NetRoute -DestinationPrefix "0.0.0.0/0" `
-                     -ErrorAction SilentlyContinue |
-                 Where-Object { $_.NextHop -ne $BLOCKED_GATEWAY } |
-                 Sort-Object RouteMetric |
-                 Select-Object -First 1 -ExpandProperty NextHop)
-
-# Fallback if auto-detect fails
-if (-not $REAL_GATEWAY -or $REAL_GATEWAY -eq "") {
-    $REAL_GATEWAY = "192.168.1.4"
-}
+$SERVER_URL      = "http://SERVER_IP:3000/api/usage"   # <-- SET THIS during install
+$SERVER_URL_BASE = "http://SERVER_IP:3000"          # <-- ADD THIS during install
+$DEVICE_NAME = $env:COMPUTERNAME
+$INTERVAL    = 15   # seconds between snapshots
+$STATUS_CHECK_EVERY = 4   # Check block status every N intervals (every 60s = 4 x 15s)
+$statusCheckCounter = 0   # Internal counter — no need to change this
 
 # ── Resolve local IPv4 address ─────────────────────────────
 $DEVICE_IP = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
@@ -47,13 +31,13 @@ if (-not $DEVICE_IP) { $DEVICE_IP = "0.0.0.0" }
 function Is-PrivateIP([string]$ip) {
     if ([string]::IsNullOrWhiteSpace($ip)) { return $true }
     return (
-        $ip -match '^10\.'                          -or
-        $ip -match '^192\.168\.'                    -or
-        $ip -match '^172\.(1[6-9]|2[0-9]|3[01])\.' -or
-        $ip -match '^127\.'                         -or
-        $ip -match '^169\.254\.'                    -or
-        $ip -match '^0\.'                           -or
-        $ip -match '^::'                            -or
+        $ip -match '^10\.'                          -or   # Class A private
+        $ip -match '^192\.168\.'                    -or   # Class C private
+        $ip -match '^172\.(1[6-9]|2[0-9]|3[01])\.' -or   # Class B private
+        $ip -match '^127\.'                         -or   # Loopback
+        $ip -match '^169\.254\.'                    -or   # APIPA / link-local
+        $ip -match '^0\.'                           -or   # Unspecified
+        $ip -match '^::'                            -or   # IPv6 loopback/unspecified
         $ip -eq '0.0.0.0'                           -or
         $ip -eq ''
     )
@@ -97,28 +81,29 @@ function Get-InternetUDPCount {
 
 # ── Combined snapshot: NIC bytes + connection profile ──────
 function Get-SplitBytes {
-    $nic           = Get-NICBytes
-    $internetTCP   = Get-InternetTCPCount
-    $lanTCP        = Get-LANTCPCount
-    $internetUDP   = Get-InternetUDPCount
-    $totalInternet = $internetTCP + $internetUDP
+    $nic             = Get-NICBytes
+    $internetTCP     = Get-InternetTCPCount
+    $lanTCP          = Get-LANTCPCount
+    $internetUDP     = Get-InternetUDPCount
+
+    # Total "internet signals" = TCP public + UDP public (QUIC)
+    $totalInternetConns = $internetTCP + $internetUDP
 
     return @{
-        TotalRx       = $nic.Rx
-        TotalTx       = $nic.Tx
-        InternetConns = $totalInternet
-        LANConns      = $lanTCP
-        HasInternet   = ($totalInternet -gt 0)
-        HasLANOnly    = ($totalInternet -eq 0 -and $lanTCP -gt 0)
+        TotalRx             = $nic.Rx
+        TotalTx             = $nic.Tx
+        InternetConns       = $totalInternetConns   # TCP public + UDP/QUIC public
+        LANConns            = $lanTCP               # TCP private (SMB, AD, etc.)
+        HasInternet         = ($totalInternetConns -gt 0)
+        HasLANOnly          = ($totalInternetConns -eq 0 -and $lanTCP -gt 0)
     }
 }
 
 # ── Error logger with rotation ─────────────────────────────
 function Write-ErrorLog([string]$msg) {
     $logPath = "C:\NetAgent\errors.log"
-    Add-Content -Path $logPath `
-        -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): $msg" `
-        -ErrorAction SilentlyContinue
+    Add-Content -Path $logPath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): $msg" `
+                -ErrorAction SilentlyContinue
     try {
         if ((Get-Item $logPath -ErrorAction SilentlyContinue).Length -gt 5MB) {
             Rename-Item $logPath "$logPath.old" -Force -ErrorAction SilentlyContinue
@@ -126,81 +111,39 @@ function Write-ErrorLog([string]$msg) {
     } catch {}
 }
 
-# ── Get current default gateway ────────────────────────────
-function Get-DefaultGateway {
-    $gw = Get-NetRoute -DestinationPrefix "0.0.0.0/0" `
-              -ErrorAction SilentlyContinue |
-          Sort-Object RouteMetric |
-          Select-Object -First 1 -ExpandProperty NextHop
-    return $gw
-}
-
-# ── Block internet: swap to dead-end gateway ───────────────
+# ── Apply internet block via Windows Firewall ──────────────
 function Set-InternetBlock {
-    try {
-        $currentGW = Get-DefaultGateway
-        if ($currentGW -ne $BLOCKED_GATEWAY) {
-            # Remove all current default routes
-            Get-NetRoute -DestinationPrefix "0.0.0.0/0" `
-                -ErrorAction SilentlyContinue |
-                Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+    $outExists = Get-NetFirewallRule -DisplayName "BandGuard-BlockInternet-OUT" `
+                 -ErrorAction SilentlyContinue
+    $inExists  = Get-NetFirewallRule -DisplayName "BandGuard-BlockInternet-IN"  `
+                 -ErrorAction SilentlyContinue
 
-            # Add dead-end gateway (persistent — survives reboot)
-            New-NetRoute -DestinationPrefix "0.0.0.0/0" `
-                -NextHop $BLOCKED_GATEWAY `
-                -RouteMetric 1 `
-                -PolicyStore PersistentStore `
-                -ErrorAction Stop | Out-Null
-
-            Write-ErrorLog "INFO: Gateway changed to $BLOCKED_GATEWAY — internet BLOCKED"
-        }
-    } catch {
-        # Fallback to route.exe if New-NetRoute fails
-        try {
-            route delete 0.0.0.0 | Out-Null
-            route add 0.0.0.0 mask 0.0.0.0 $BLOCKED_GATEWAY metric 1 -p | Out-Null
-            Write-ErrorLog "INFO: Gateway changed via route.exe to $BLOCKED_GATEWAY — internet BLOCKED"
-        } catch {
-            Write-ErrorLog "ERROR: Set-InternetBlock failed: $_"
-        }
+    if (-not $outExists) {
+        New-NetFirewallRule `
+            -DisplayName "BandGuard-BlockInternet-OUT" `
+            -Direction Outbound `
+            -Action Block `
+            -RemoteAddress Internet `
+            -Profile Any `
+            -Enabled True | Out-Null
+    }
+    if (-not $inExists) {
+        New-NetFirewallRule `
+            -DisplayName "BandGuard-BlockInternet-IN" `
+            -Direction Inbound `
+            -Action Block `
+            -RemoteAddress Internet `
+            -Profile Any `
+            -Enabled True | Out-Null
     }
 }
 
-# ── Unblock internet: restore real gateway ─────────────────
+# ── Remove internet block from Windows Firewall ────────────
 function Remove-InternetBlock {
-    try {
-        $currentGW = Get-DefaultGateway
-        if ($currentGW -ne $REAL_GATEWAY) {
-            # Remove dead-end routes
-            Get-NetRoute -DestinationPrefix "0.0.0.0/0" `
-                -ErrorAction SilentlyContinue |
-                Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-
-            # Restore real gateway (persistent)
-            New-NetRoute -DestinationPrefix "0.0.0.0/0" `
-                -NextHop $REAL_GATEWAY `
-                -RouteMetric 1 `
-                -PolicyStore PersistentStore `
-                -ErrorAction Stop | Out-Null
-
-            Write-ErrorLog "INFO: Gateway restored to $REAL_GATEWAY — internet UNBLOCKED"
-        }
-    } catch {
-        # Fallback to route.exe
-        try {
-            route delete 0.0.0.0 | Out-Null
-            route add 0.0.0.0 mask 0.0.0.0 $REAL_GATEWAY metric 1 -p | Out-Null
-            Write-ErrorLog "INFO: Gateway restored via route.exe to $REAL_GATEWAY — internet UNBLOCKED"
-        } catch {
-            Write-ErrorLog "ERROR: Remove-InternetBlock failed: $_"
-        }
-    }
-}
-
-# ── Check if currently blocked ─────────────────────────────
-function Is-BlockActive {
-    $currentGW = Get-DefaultGateway
-    return ($currentGW -eq $BLOCKED_GATEWAY)
+    Remove-NetFirewallRule -DisplayName "BandGuard-BlockInternet-OUT" `
+        -ErrorAction SilentlyContinue
+    Remove-NetFirewallRule -DisplayName "BandGuard-BlockInternet-IN"  `
+        -ErrorAction SilentlyContinue
 }
 
 # ── Single Instance Mutex ──────────────────────────────────
@@ -211,9 +154,6 @@ if (-not $mutex.WaitOne(0, $false)) {
 }
 
 try {
-    # Log startup info — confirm auto-detected gateway
-    Write-ErrorLog "INFO: Agent v8.1 started | Device=$DEVICE_NAME | IP=$DEVICE_IP | RealGW=$REAL_GATEWAY | BlockGW=$BLOCKED_GATEWAY"
-
     $before = Get-SplitBytes
 
     while ($true) {
@@ -225,24 +165,31 @@ try {
         $deltaRx = [long]$after.TotalRx - [long]$before.TotalRx
         $deltaTx = [long]$after.TotalTx - [long]$before.TotalTx
 
+        # Advance baseline — always move forward
         $before = $after
 
         # Guard: NIC counter reset or wraparound
         if ($deltaRx -lt 0 -or $deltaTx -lt 0) { continue }
 
-        # ── EARLY EXIT: Pure LAN-only activity (SMB etc.) ──
+        # ── EARLY EXIT: Pure LAN-only activity ────────────
+        # No internet connections (TCP or UDP/QUIC) but LAN connections exist
+        # → this delta is entirely SMB / LAN traffic → discard
         if ($after.HasLANOnly) { continue }
 
-        # ── EARLY EXIT: No connections + tiny background noise
+        # ── EARLY EXIT: No connections at all + tiny traffic
+        # (background noise, ARP, broadcasts)
         $hasTraffic = ($deltaRx -gt 1024 -or $deltaTx -gt 512)
         if (-not $after.HasInternet -and -not $hasTraffic) { continue }
 
         # ── PRO-RATING: Mixed LAN + Internet simultaneously ─
+        # Example: SMB file copy + YouTube playing at same time
+        # Attribute bytes proportionally by connection count ratio
         $totalConns    = $after.InternetConns + $after.LANConns
         $internetRatio = if ($totalConns -gt 0) {
                              [double]$after.InternetConns / [double]$totalConns
                          } else { 1.0 }
 
+        # Apply ratio only when LAN connections are also present
         $reportRx = if ($after.LANConns -gt 0 -and $after.InternetConns -gt 0) {
                         [long]($deltaRx * $internetRatio)
                     } else { $deltaRx }
@@ -251,7 +198,7 @@ try {
                         [long]($deltaTx * $internetRatio)
                     } else { $deltaTx }
 
-        # ── SEND usage to server ───────────────────────────
+        # ── SEND to server ─────────────────────────────────
         if ($after.HasInternet -and ($reportRx -gt 0 -or $reportTx -gt 0)) {
             $payload = @{
                 device_name    = $DEVICE_NAME
@@ -271,7 +218,7 @@ try {
             }
         }
 
-        # ── SELF-ENFORCEMENT: Poll server for block status ─
+        # ── SELF-ENFORCEMENT: Poll server for block status ─────
         $statusCheckCounter++
         if ($statusCheckCounter -ge $STATUS_CHECK_EVERY) {
             $statusCheckCounter = 0
@@ -281,13 +228,19 @@ try {
                 $deviceStatus = Invoke-RestMethod -Uri $statusUrl -Method GET `
                                     -TimeoutSec 5 -ErrorAction Stop
 
-                $blockActive = Is-BlockActive
+                $blockRuleExists = Get-NetFirewallRule `
+                                    -DisplayName "BandGuard-BlockInternet-OUT" `
+                                    -ErrorAction SilentlyContinue
 
-                if ($deviceStatus.is_blocked -eq 1 -and -not $blockActive) {
+                if ($deviceStatus.is_blocked -eq 1 -and -not $blockRuleExists) {
+                    # Server says blocked → apply firewall rules
                     Set-InternetBlock
+                    Write-ErrorLog "INFO: Internet blocked by quota enforcement"
 
-                } elseif ($deviceStatus.is_blocked -eq 0 -and $blockActive) {
+                } elseif ($deviceStatus.is_blocked -eq 0 -and $blockRuleExists) {
+                    # Server says unblocked (reset/manual) → remove firewall rules
                     Remove-InternetBlock
+                    Write-ErrorLog "INFO: Internet unblocked - quota reset"
                 }
 
             } catch {
