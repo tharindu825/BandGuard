@@ -1,16 +1,13 @@
-﻿# ============================================================
-# Internet Usage Agent v9.0
+# ============================================================
+# Internet Usage Agent v8.1
 # Deploy to each PC at: C:\NetAgent\agent.ps1
 # Runs every 60 seconds via Task Scheduler as SYSTEM
 #
-# v9.0 Fixes:
-#   - SMB/LAN traffic no longer counted as internet usage
-#   - Active SMB transfer detection via Get-SmbConnection
-#   - 20% cap on internet attribution during SMB co-activity
-#   - Port filter excludes 445/139/135 from internet connections
-#   - Sanity cap: max 200MB per 15s interval (prevents spikes)
-#   - Gateway-based internet blocking (AD/GPO safe)
-#   - Auto-detects real gateway at startup
+# v8.1 Changes:
+#   - Auto-detects real gateway at startup (no hardcoding)
+#   - Works on any PC regardless of gateway IP
+#   - Block = change default gateway to 192.168.1.11
+#   - Unblock = restore auto-detected real gateway
 # ============================================================
 
 $SERVER_URL         = "http://192.168.1.32:3000/api/usage"
@@ -23,12 +20,15 @@ $statusCheckCounter = 0
 $BLOCKED_GATEWAY    = "192.168.1.11"   # dead-end gateway — never changes
 
 # ── Auto-detect real gateway at startup ───────────────────
+# Reads whatever gateway is currently set (works on any PC)
+# Excludes the blocked gateway in case PC rebooted while blocked
 $REAL_GATEWAY = (Get-NetRoute -DestinationPrefix "0.0.0.0/0" `
                      -ErrorAction SilentlyContinue |
                  Where-Object { $_.NextHop -ne $BLOCKED_GATEWAY } |
                  Sort-Object RouteMetric |
                  Select-Object -First 1 -ExpandProperty NextHop)
 
+# Fallback if auto-detect fails
 if (-not $REAL_GATEWAY -or $REAL_GATEWAY -eq "") {
     $REAL_GATEWAY = "192.168.1.4"
 }
@@ -70,28 +70,21 @@ function Get-NICBytes {
     }
 }
 
-# ── Count TCP connections to public IPs ────────────────────
-# Excludes SMB ports (445, 139, 135) and admin ports (3389, 5985)
+# ── Count TCP connections to public IPs (internet) ─────────
 function Get-InternetTCPCount {
     $conns = Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue |
-             Where-Object {
-                 -not (Is-PrivateIP $_.RemoteAddress) -and
-                 $_.RemotePort -notin @(445, 139, 135, 3389, 5985, 5986)
-             }
+             Where-Object { -not (Is-PrivateIP $_.RemoteAddress) }
     return @($conns).Count
 }
 
-# ── Count SMB/LAN TCP connections ──────────────────────────
+# ── Count TCP connections to private IPs (LAN/SMB) ─────────
 function Get-LANTCPCount {
     $conns = Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue |
-             Where-Object {
-                 (Is-PrivateIP $_.RemoteAddress) -or
-                 ($_.RemotePort -in @(445, 139, 135))
-             }
+             Where-Object { Is-PrivateIP $_.RemoteAddress }
     return @($conns).Count
 }
 
-# ── Count UDP endpoints to public IPs (QUIC/HTTP3) ─────────
+# ── Count UDP endpoints to public IPs (QUIC/YouTube/HTTP3) ─
 function Get-InternetUDPCount {
     try {
         $udp = Get-NetUDPEndpoint -ErrorAction SilentlyContinue |
@@ -102,17 +95,7 @@ function Get-InternetUDPCount {
     }
 }
 
-# ── Detect if SMB file transfer is actively happening ──────
-function Is-SMBTransferActive {
-    try {
-        $smb = Get-SmbConnection -ErrorAction SilentlyContinue
-        return (@($smb).Count -gt 0)
-    } catch {
-        return $false
-    }
-}
-
-# ── Combined snapshot ──────────────────────────────────────
+# ── Combined snapshot: NIC bytes + connection profile ──────
 function Get-SplitBytes {
     $nic           = Get-NICBytes
     $internetTCP   = Get-InternetTCPCount
@@ -157,10 +140,12 @@ function Set-InternetBlock {
     try {
         $currentGW = Get-DefaultGateway
         if ($currentGW -ne $BLOCKED_GATEWAY) {
+            # Remove all current default routes
             Get-NetRoute -DestinationPrefix "0.0.0.0/0" `
                 -ErrorAction SilentlyContinue |
                 Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
 
+            # Add dead-end gateway (persistent — survives reboot)
             New-NetRoute -DestinationPrefix "0.0.0.0/0" `
                 -NextHop $BLOCKED_GATEWAY `
                 -RouteMetric 1 `
@@ -170,6 +155,7 @@ function Set-InternetBlock {
             Write-ErrorLog "INFO: Gateway changed to $BLOCKED_GATEWAY — internet BLOCKED"
         }
     } catch {
+        # Fallback to route.exe if New-NetRoute fails
         try {
             route delete 0.0.0.0 | Out-Null
             route add 0.0.0.0 mask 0.0.0.0 $BLOCKED_GATEWAY metric 1 -p | Out-Null
@@ -185,10 +171,12 @@ function Remove-InternetBlock {
     try {
         $currentGW = Get-DefaultGateway
         if ($currentGW -ne $REAL_GATEWAY) {
+            # Remove dead-end routes
             Get-NetRoute -DestinationPrefix "0.0.0.0/0" `
                 -ErrorAction SilentlyContinue |
                 Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
 
+            # Restore real gateway (persistent)
             New-NetRoute -DestinationPrefix "0.0.0.0/0" `
                 -NextHop $REAL_GATEWAY `
                 -RouteMetric 1 `
@@ -198,6 +186,7 @@ function Remove-InternetBlock {
             Write-ErrorLog "INFO: Gateway restored to $REAL_GATEWAY — internet UNBLOCKED"
         }
     } catch {
+        # Fallback to route.exe
         try {
             route delete 0.0.0.0 | Out-Null
             route add 0.0.0.0 mask 0.0.0.0 $REAL_GATEWAY metric 1 -p | Out-Null
@@ -222,7 +211,8 @@ if (-not $mutex.WaitOne(0, $false)) {
 }
 
 try {
-    Write-ErrorLog "INFO: Agent v9.0 started | Device=$DEVICE_NAME | IP=$DEVICE_IP | RealGW=$REAL_GATEWAY | BlockGW=$BLOCKED_GATEWAY"
+    # Log startup info — confirm auto-detected gateway
+    Write-ErrorLog "INFO: Agent v8.1 started | Device=$DEVICE_NAME | IP=$DEVICE_IP | RealGW=$REAL_GATEWAY | BlockGW=$BLOCKED_GATEWAY"
 
     $before = Get-SplitBytes
 
@@ -240,44 +230,26 @@ try {
         # Guard: NIC counter reset or wraparound
         if ($deltaRx -lt 0 -or $deltaTx -lt 0) { continue }
 
-        # ── EARLY EXIT: Pure LAN-only / SMB-only activity ──
+        # ── EARLY EXIT: Pure LAN-only activity (SMB etc.) ──
         if ($after.HasLANOnly) { continue }
 
         # ── EARLY EXIT: No connections + tiny background noise
         $hasTraffic = ($deltaRx -gt 1024 -or $deltaTx -gt 512)
         if (-not $after.HasInternet -and -not $hasTraffic) { continue }
 
-        # ── SMART PRO-RATING ───────────────────────────────
-        $reportRx = $deltaRx
-        $reportTx = $deltaTx
+        # ── PRO-RATING: Mixed LAN + Internet simultaneously ─
+        $totalConns    = $after.InternetConns + $after.LANConns
+        $internetRatio = if ($totalConns -gt 0) {
+                             [double]$after.InternetConns / [double]$totalConns
+                         } else { 1.0 }
 
-        if ($after.LANConns -gt 0 -and $after.InternetConns -gt 0) {
+        $reportRx = if ($after.LANConns -gt 0 -and $after.InternetConns -gt 0) {
+                        [long]($deltaRx * $internetRatio)
+                    } else { $deltaRx }
 
-            $smbActive = Is-SMBTransferActive
-
-            if ($smbActive) {
-                # SMB actively transferring + internet exists
-                # Use very conservative ratio — cap at 20% max
-                # Prevents 7.88 GB SMB copy from appearing as internet usage
-                $rawRatio      = [double]$after.InternetConns /
-                                 [double]($after.InternetConns + $after.LANConns)
-                $internetRatio = [Math]::Min($rawRatio, 0.20)
-                Write-ErrorLog "DEBUG: SMB active — capped ratio=$([Math]::Round($internetRatio,3)) | LAN=$($after.LANConns) | NET=$($after.InternetConns)"
-            } else {
-                # LAN connections exist but no active SMB transfer
-                $internetRatio = [double]$after.InternetConns /
-                                 [double]($after.InternetConns + $after.LANConns)
-            }
-
-            $reportRx = [long]($deltaRx * $internetRatio)
-            $reportTx = [long]($deltaTx * $internetRatio)
-        }
-
-        # ── SANITY CAP ─────────────────────────────────────
-        # 200 MB max per 15s = ~107 Mbps — adjust if your line is faster
-        $maxBytesPerInterval = 200MB
-        $reportRx = [Math]::Min($reportRx, $maxBytesPerInterval)
-        $reportTx = [Math]::Min($reportTx, $maxBytesPerInterval)
+        $reportTx = if ($after.LANConns -gt 0 -and $after.InternetConns -gt 0) {
+                        [long]($deltaTx * $internetRatio)
+                    } else { $deltaTx }
 
         # ── SEND usage to server ───────────────────────────
         if ($after.HasInternet -and ($reportRx -gt 0 -or $reportTx -gt 0)) {
